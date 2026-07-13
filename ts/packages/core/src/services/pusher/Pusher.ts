@@ -10,6 +10,16 @@ import {
 import logger from '../../utils/logger';
 import { telemetry } from '../../telemetry/Telemetry';
 
+const MAX_CHUNK_INDEX = 1_000;
+const CHUNK_TTL_MS = 60_000;
+const MAX_PENDING_CHUNKED_EVENTS = 100;
+
+type PendingChunkedEvent = {
+  chunks: Map<number, string>;
+  finalIndex?: number;
+  timeout: ReturnType<typeof setTimeout>;
+};
+
 export class PusherService {
   // these values are set via the Apollo API `/internal/sdk/realtime/credentials` endpoint
   private clientId!: string;
@@ -21,6 +31,7 @@ export class PusherService {
   private apiKey!: string;
   private pusherClient!: PusherClient;
   private composioClient!: ComposioClient;
+  private chunkCleanup?: () => void;
 
   constructor(client: ComposioClient) {
     this.composioClient = client;
@@ -94,58 +105,97 @@ export class PusherService {
     channel: PusherClient,
     event: string,
     callback: (data: Record<string, unknown>) => void
-  ): void {
+  ): () => void {
     try {
       channel.bind(event, callback);
 
       // Now the chunked variation. Allows arbitrarily long messages.
-      const events: {
-        [key: string]: { chunks: string[]; receivedFinal: boolean };
-      } = {};
+      const events = new Map<string, PendingChunkedEvent>();
+
+      const deleteEvent = (id: string) => {
+        const pending = events.get(id);
+        if (pending) {
+          clearTimeout(pending.timeout);
+          events.delete(id);
+        }
+      };
 
       channel.bind('chunked-' + event, data => {
+        let eventId: string | undefined;
         try {
           const typedData = data as TChunkedTriggerData;
+          eventId = typedData?.id;
 
           // Validate chunked data
           if (
             !typedData ||
             typeof typedData.id !== 'string' ||
-            typeof typedData.index !== 'number'
+            typedData.id.length === 0 ||
+            typeof typedData.index !== 'number' ||
+            !Number.isInteger(typedData.index) ||
+            typedData.index < 0 ||
+            typedData.index > MAX_CHUNK_INDEX ||
+            typeof typedData.chunk !== 'string' ||
+            typeof typedData.final !== 'boolean'
           ) {
             throw new Error('Invalid chunked trigger data format');
           }
 
-          if (!events.hasOwnProperty(typedData.id)) {
-            events[typedData.id] = { chunks: [], receivedFinal: false };
+          if (!events.has(typedData.id)) {
+            if (events.size >= MAX_PENDING_CHUNKED_EVENTS) {
+              const oldestId = events.keys().next().value;
+              if (oldestId !== undefined) deleteEvent(oldestId);
+            }
+
+            const timeout = setTimeout(() => {
+              events.delete(typedData.id);
+            }, CHUNK_TTL_MS);
+            if (typeof timeout === 'object') timeout.unref?.();
+            events.set(typedData.id, { chunks: new Map(), timeout });
           }
 
-          const ev = events[typedData.id];
-          ev.chunks[typedData.index] = typedData.chunk;
+          const pending = events.get(typedData.id)!;
+          pending.chunks.set(typedData.index, typedData.chunk);
 
-          if (typedData.final) ev.receivedFinal = true;
+          if (typedData.final) {
+            if (pending.finalIndex !== undefined && pending.finalIndex !== typedData.index) {
+              throw new Error('Conflicting final chunk indices');
+            }
+            pending.finalIndex = typedData.index;
+          }
 
-          if (ev.receivedFinal && ev.chunks.length === Object.keys(ev.chunks).length) {
-            try {
-              const parsedData = JSON.parse(ev.chunks.join(''));
-              callback(parsedData);
-            } catch (parseError: unknown) {
-              const errorMessage =
-                parseError instanceof Error ? parseError.message : String(parseError);
-              logger.error('Failed to parse chunked data:', errorMessage);
-            } finally {
-              delete events[typedData.id];
+          const finalIndex = pending.finalIndex;
+          if (finalIndex !== undefined) {
+            if ([...pending.chunks.keys()].some(index => index > finalIndex)) {
+              throw new Error('Chunk index exceeds the final chunk index');
+            }
+
+            const chunks = Array.from({ length: finalIndex + 1 }, (_, index) =>
+              pending.chunks.get(index)
+            );
+            if (chunks.every((chunk): chunk is string => chunk !== undefined)) {
+              try {
+                const parsedData = JSON.parse(chunks.join(''));
+                callback(parsedData);
+              } catch (parseError: unknown) {
+                const errorMessage =
+                  parseError instanceof Error ? parseError.message : String(parseError);
+                logger.error('Failed to parse chunked data:', errorMessage);
+              } finally {
+                deleteEvent(typedData.id);
+              }
             }
           }
         } catch (error: unknown) {
           const errorMessage = error instanceof Error ? error.message : String(error);
           logger.error('Error processing chunked trigger data:', errorMessage);
-          // Clean up the event data to prevent memory leaks
-          if (data && typeof data === 'object' && 'id' in data) {
-            delete events[data.id as string];
-          }
+          if (eventId !== undefined) deleteEvent(eventId);
         }
       });
+
+      return () => {
+        for (const id of events.keys()) deleteEvent(id);
+      };
     } catch (error: unknown) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       logger.error('Failed to bind chunked events:', error);
@@ -191,7 +241,12 @@ export class PusherService {
         }
       };
 
-      this.bindWithChunking(channel as PusherClient, 'trigger_to_client', safeCallback);
+      this.chunkCleanup?.();
+      this.chunkCleanup = this.bindWithChunking(
+        channel as PusherClient,
+        'trigger_to_client',
+        safeCallback
+      );
 
       logger.info(`✅ Subscribed to triggers. You should start receiving events now.`);
     } catch (error) {
@@ -213,6 +268,8 @@ export class PusherService {
    * @param channelName - The name of the Pusher channel to unsubscribe from
    */
   async unsubscribe() {
+    this.chunkCleanup?.();
+    this.chunkCleanup = undefined;
     try {
       logger.debug(`[PusherService] Unsubscribing from channel: ${this.pusherChannel}`);
       const pusherClient = await this.getPusherClient();

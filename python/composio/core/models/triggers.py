@@ -425,7 +425,7 @@ _ = {
 
 
 class _ChunkedTriggerEventData(te.TypedDict):
-    """Cunked trigger event data model."""
+    """Chunked trigger event data model."""
 
     id: str
     index: int
@@ -450,6 +450,17 @@ TriggerCallback = t.Callable[[TriggerEvent], None]
 # Realtime trigger frames can carry message bodies / PII, so the raw frame is
 # never logged in full — only a bounded preview when it fails to parse.
 _MAX_LOGGED_FRAME_CHARS = 512
+_MAX_CHUNK_INDEX = 1_000
+_CHUNK_TTL_SECONDS = 60.0
+_MAX_PENDING_CHUNKED_EVENTS = 100
+
+
+class _PendingChunkedEvent(te.TypedDict):
+    """Chunks accumulated for one realtime event."""
+
+    chunks: t.Dict[int, str]
+    final_index: t.Optional[int]
+    created_at: float
 
 
 def _truncate_frame(event: str) -> str:
@@ -585,7 +596,7 @@ class TriggerSubscription(Resource):
         super().__init__(client=client)
         self.client = client
         self._alive = False
-        self._chunks: t.Dict[str, t.Dict[int, str]] = {}
+        self._chunks: t.Dict[str, _PendingChunkedEvent] = {}
         self._callbacks: t.List[t.Tuple[TriggerCallback, TriggerEventFilters]] = []
 
     def handle(
@@ -668,14 +679,73 @@ class TriggerSubscription(Resource):
 
     def _handle_chunked_events(self, event: str) -> None:
         """Handle chunked events."""
-        data = _ChunkedTriggerEventData(**json.loads(event))  # type: ignore
-        if data["id"] not in self._chunks:
-            self._chunks[data["id"]] = {}
+        event_id: t.Optional[str] = None
+        try:
+            raw_data = json.loads(event)
+            if not isinstance(raw_data, dict):
+                raise ValueError("Chunked trigger data must be an object")
 
-        self._chunks[data["id"]][data["index"]] = data["chunk"]
-        if data["final"]:
-            _chunks = self._chunks.pop(data["id"])
-            self._handle_event(event="".join([_chunks[idx] for idx in sorted(_chunks)]))
+            data = t.cast(_ChunkedTriggerEventData, raw_data)
+            event_id = data.get("id")
+            index = data.get("index")
+            chunk = data.get("chunk")
+            final = data.get("final")
+            if (
+                not isinstance(event_id, str)
+                or not event_id
+                or not isinstance(index, int)
+                or isinstance(index, bool)
+                or index < 0
+                or index > _MAX_CHUNK_INDEX
+                or not isinstance(chunk, str)
+                or not isinstance(final, bool)
+            ):
+                raise ValueError("Invalid chunked trigger data format")
+
+            now = time.monotonic()
+            # Sweep on chunk traffic rather than running a background thread.
+            # The pending-entry cap still bounds memory while the channel is idle.
+            for pending_id, pending in list(self._chunks.items()):
+                if now - pending["created_at"] > _CHUNK_TTL_SECONDS:
+                    self._chunks.pop(pending_id, None)
+
+            if event_id not in self._chunks:
+                if len(self._chunks) >= _MAX_PENDING_CHUNKED_EVENTS:
+                    self._chunks.pop(next(iter(self._chunks)))
+                self._chunks[event_id] = {
+                    "chunks": {},
+                    "final_index": None,
+                    "created_at": now,
+                }
+
+            pending = self._chunks[event_id]
+            pending["chunks"][index] = chunk
+            if final:
+                if pending["final_index"] not in (None, index):
+                    raise ValueError("Conflicting final chunk indices")
+                pending["final_index"] = index
+
+            final_index = pending["final_index"]
+            if final_index is None:
+                return
+            if any(chunk_index > final_index for chunk_index in pending["chunks"]):
+                raise ValueError("Chunk index exceeds the final chunk index")
+            if not all(
+                chunk_index in pending["chunks"]
+                for chunk_index in range(final_index + 1)
+            ):
+                return
+
+            chunks = self._chunks.pop(event_id)["chunks"]
+            self._handle_event(
+                event="".join(
+                    chunks[chunk_index] for chunk_index in range(final_index + 1)
+                )
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            if event_id is not None:
+                self._chunks.pop(event_id, None)
+            self.logger.warning(f"Error processing chunked trigger data: {error}")
 
     def _filters_match(
         self,
@@ -780,11 +850,13 @@ class TriggerSubscription(Resource):
 
     def stop(self) -> None:
         """Stop the trigger listener."""
+        self._chunks.clear()
         self._connection.disconnect()
         self._alive = False
 
     def restart(self) -> None:
         """Restart the subscription connection"""
+        self._chunks.clear()
         self._connection.disconnect()
         self._connection._connect()  # pylint: disable=protected-access
 

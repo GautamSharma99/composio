@@ -1410,6 +1410,93 @@ class TestTriggerSubscriptionParsing:
         assert subscription._parse_payload("not-json") is None
         assert subscription._parse_payload(json.dumps({"unexpected": True})) is None
 
+    def test_chunked_event_waits_for_missing_chunks(self, subscription):
+        """A final chunk does not complete an event while an index is missing."""
+        subscription._handle_event = Mock()
+
+        subscription._handle_chunked_events(
+            json.dumps({"id": "evt-1", "index": 0, "chunk": '{"ok":', "final": False})
+        )
+        subscription._handle_chunked_events(
+            json.dumps({"id": "evt-1", "index": 2, "chunk": "}", "final": True})
+        )
+
+        subscription._handle_event.assert_not_called()
+
+        subscription._handle_chunked_events(
+            json.dumps({"id": "evt-1", "index": 1, "chunk": "true", "final": False})
+        )
+
+        subscription._handle_event.assert_called_once_with(event='{"ok":true}')
+
+    def test_chunked_event_expires_when_incomplete(self, subscription):
+        """An incomplete event cannot be completed after its TTL expires."""
+        subscription._handle_event = Mock()
+
+        with patch(
+            "composio.core.models.triggers.time.monotonic",
+            side_effect=[0.0, 1.0, 61.0],
+        ):
+            subscription._handle_chunked_events(
+                json.dumps(
+                    {"id": "evt-1", "index": 0, "chunk": '{"ok":', "final": False}
+                )
+            )
+            subscription._handle_chunked_events(
+                json.dumps({"id": "evt-1", "index": 2, "chunk": "}", "final": True})
+            )
+            subscription._handle_chunked_events(
+                json.dumps({"id": "evt-1", "index": 1, "chunk": "true", "final": False})
+            )
+
+        subscription._handle_event.assert_not_called()
+
+    def test_chunked_event_rejects_out_of_range_index(self, subscription):
+        """A huge sparse index cannot poison a later valid event with the same ID."""
+        subscription._handle_event = Mock()
+
+        subscription._handle_chunked_events(
+            json.dumps(
+                {"id": "evt-1", "index": 1001, "chunk": "ignored", "final": False}
+            )
+        )
+        subscription._handle_chunked_events(
+            json.dumps(
+                {"id": "evt-1", "index": 0, "chunk": '{"ok":true}', "final": True}
+            )
+        )
+
+        subscription._handle_event.assert_called_once_with(event='{"ok":true}')
+
+    def test_chunked_events_cap_pending_reassemblies(self, subscription):
+        """The oldest event is evicted when the pending-event cap is reached."""
+        subscription._handle_event = Mock()
+
+        with patch("composio.core.models.triggers.time.monotonic", return_value=0.0):
+            subscription._handle_chunked_events(
+                json.dumps(
+                    {"id": "oldest", "index": 0, "chunk": '{"ok":', "final": False}
+                )
+            )
+            for index in range(100):
+                subscription._handle_chunked_events(
+                    json.dumps(
+                        {
+                            "id": f"evt-{index}",
+                            "index": 0,
+                            "chunk": "pending",
+                            "final": False,
+                        }
+                    )
+                )
+            subscription._handle_chunked_events(
+                json.dumps(
+                    {"id": "oldest", "index": 1, "chunk": "true}", "final": True}
+                )
+            )
+
+        subscription._handle_event.assert_not_called()
+
     def test_parse_payload_legacy_non_dict_metadata_does_not_raise(self, subscription):
         """A legacy frame with a non-dict metadata is skipped, not raised.
 
